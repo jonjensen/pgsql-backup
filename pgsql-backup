@@ -1,0 +1,326 @@
+#!/bin/bash
+
+# PostgreSQL database dumper
+# A wrapper around pg_dump and pg_dumpall, by:
+# Jon Jensen <jon@endpointdev.com>
+# Josh Williams <jwilliams@endpointdev.com>
+# Spencer Christensen
+# Jeffry Johar <jeffry@endpointdev.com>
+# Copyright © End Point Corporation
+# License: BSD 2-clause
+#
+# Dumps the databases and compresses the output, but keeps the old dump if
+# nothing has changed since then, to minimize changes visible to rsync.
+
+# Set these environment variables to change how the script functions:
+# BACKUPDIR -- By default will search a few places for a /backups path
+# DBEXCLUDE -- List of databases to skip, space separated; by default will only skip "template0"
+# DBORDERBY -- Database dump order, "size" (default) or "name"
+# COMPRESSOR       -- Compression command to use, by default will do a search to see what the system has
+# COMPRESS_THREADS -- Limit the amount of CPU for compression, defaults to using all CPUs
+# COMPRESS_LEVEL   -- Compression level number given to the compressor, defaults to whatever it uses by default
+# COMPRESS_INLINE:
+## Set to 0 or unset: pg_dump output written directly to a (much larger) file, then compressed as a separate step.
+## Set to 1: pg_dump output piped to the compressor directly, transaction is held open for longer.
+
+# Also, if needed, create executable scripts alongside this one:
+## pgsql-backup-pre  -- Executed before backups start
+## pgsql-backup-post -- Executed if all backups run successfully, and given the list of changed files as arguments
+
+set -o pipefail
+
+if [ -z "$PGUSER" ]; then
+	export PGUSER=postgres
+fi
+pg_home=$( echo ~postgres )
+if [ -n "$BACKUPDIR" ]; then
+	backupdir="$BACKUPDIR"
+else
+	backupdir=
+	for d in $pg_home/*/main/backups $pg_home/*/backups $pg_home/backups
+	do
+		test -d $d && backupdir=$d && break
+	done
+fi
+if [ -z "$backupdir" ]; then
+	echo "Could not find the backups dir!"
+	exit 66
+fi
+
+if [ -n "$DBEXCLUDE" ]; then
+	dbwhere=""
+	for db in $DBEXCLUDE; do
+		if [ -z "$dbwhere" ]; then
+			dbwhere="WHERE datname <> '$db'"
+		else
+			dbwhere="$dbwhere AND datname <> '$db'"
+		fi
+	done
+else
+	dbwhere="WHERE datname <> 'template0'"
+fi
+
+if [ -n "$DBORDERBY" ]; then
+	if [ "$DBORDERBY" == "name" ]; then
+		dborderby="ORDER BY datname"
+	elif [ "$DBORDERBY" == "size" ]; then
+		dborderby="ORDER BY pg_database_size(oid)"
+	else
+		dborderby="ORDER BY random()"
+	fi
+else
+	dborderby="ORDER BY pg_database_size(oid)"
+fi
+
+compress_inline=${COMPRESS_INLINE:-0}   # Default to dump, compress in separate steps
+compress_threads=${COMPRESS_THREADS:-0} # Default to using all CPU's
+compress_level=$COMPRESS_LEVEL          # Default to whatever the compressor does by default
+compressor=$COMPRESSOR                  # Do a search if needed...
+
+if [ -z "$compressor" ]; then
+	# Auto-select the best compressor that's installed
+	if zstd --version >/dev/null 2>&1; then
+		compressor=zstd
+	elif xz --version >/dev/null 2>&1; then
+		compressor=xz
+	elif pxz --version >/dev/null 2>&1; then
+		compressor=pxz
+	elif lbzip2 --version >/dev/null 2>&1; then
+		compressor=lbzip2
+	elif pbzip2 --version >/dev/null 2>&1; then
+		compressor=pbzip2
+	elif bzip2 --help >/dev/null 2>&1; then
+		compressor=bzip2
+	elif pigz --version >/dev/null 2>&1; then
+		compressor=pigz
+	elif gzip --version >/dev/null 2>&1; then
+		compressor=gzip
+	else
+		echo "Couldn't find any compressor!"
+		exit 11
+	fi
+fi
+
+trap "exit 2" INT
+
+exit=0
+
+if [ -z "$PGHOST" ]; then
+	hostname=`hostname -s`
+else
+	hostname=$PGHOST
+fi
+
+# Define compressor settings
+if [ "$compressor" == "zstd" ]; then
+	compext=.zst
+	if [ -n "$compress_threads" ]; then
+		compressor="$compressor -T$compress_threads";
+	fi
+	if [ -n "$compress_level" ]; then
+		compressor="$compressor -${compress_level}"
+	fi
+	compressor="$compressor --rm"
+elif [ "$compressor" == "xz" ]; then
+	compext=.xz
+	if [ -n "$compress_threads" ]; then
+		compressor="$compressor -T$compress_threads";
+	fi
+	if [ -n "$compress_level" ]; then
+		compressor="$compressor -${compress_level}"
+	fi
+elif [ "$compressor" == "pxz" ]; then
+	compext=.xz
+	if [ -n "$compress_threads" -a "$compress_threads" -gt "0" ]; then
+		compressor="$compressor -T$compress_threads";
+	fi
+	if [ -n "$compress_level" ]; then
+		compressor="$compressor -${compress_level}"
+	fi
+elif [ "$compressor" == "lbzip2" ]; then
+	compext=.bz2
+	if [ -n "$compress_threads" -a "$compress_threads" -gt "0" ]; then
+		compressor="$compressor -n$compress_threads";
+	fi
+	if [ -n "$compress_level" ]; then
+		compressor="$compressor -${compress_level}"
+	fi
+elif [ "$compressor" == "pbzip2" ]; then
+	compext=.bz2
+	if [ -n "$compress_threads" -a "$compress_threads" -gt "0" ]; then
+		compressor="$compressor -p$compress_threads";
+	else
+		# Load average determines max number processors to use
+		compressor="$compressor -l";
+	fi
+	if [ -n "$compress_level" ]; then
+		compressor="$compressor -${compress_level}"
+	fi
+elif [ "$compressor" == "bzip2" ]; then
+	compext=.bz2
+	if [ -n "$compress_level" ]; then
+		compressor="$compressor -${compress_level}"
+	fi
+elif [ "$compressor" == "pigz" ]; then
+	compext=.gz
+	if [ -n "$compress_threads" -a "$compress_threads" -gt "0" ]; then
+		compressor="$compressor -p$compress_threads";
+	fi
+	if [ -n "$compress_level" ]; then
+		compressor="$compressor -${compress_level}"
+	fi
+elif [ "$compressor" == "gzip" ]; then
+	compext=.gz
+	if [ -n "$compress_level" ]; then
+		compressor="$compressor -${compress_level}"
+	fi
+else
+	echo "Couldn't find compressor settings for ${compressor}!"
+	exit 11
+fi
+
+scriptpath=$(realpath "$0")
+scriptdir=$(dirname "$scriptpath")
+
+cd $backupdir || {
+	echo "Error: cd $backupdir" >&2
+	exit 5
+}
+
+if [ -x $scriptdir/pgsql-backup-pre ]; then
+	echo "Executing $scriptdir/pgsql-backup-pre"
+	$scriptdir/pgsql-backup-pre
+fi
+
+echo "Dumping PostgreSQL databases on host $hostname"
+echo "Criteria: $dbwhere"
+echo "Using compressor: $compressor"
+date
+
+umask 027
+
+successful_files=
+
+echo "Dumping global data"
+globalfile=$hostname-pgsql-GLOBAL.sql
+globalwork=$globalfile.work
+(pg_dumpall -g 3> $globalwork 1>&3 2>&1 || rm -f $globalwork) | grep -v '^connecting to '
+if [ -f $globalfile ]; then
+	cmp -s $globalfile $globalwork
+	if [ $? -eq 0 ]; then
+		echo "Dump is identical to last time; leaving old dump intact"
+		rm -f $globalwork
+	elif [ $? -eq 1 ]; then
+		echo "Dump is different; replacing old dump with new one"
+		mv $globalwork $globalfile
+		successful_files="$successful_files $globalfile"
+	else
+		echo "Error comparing new to old dump; work file remains" >&2
+		exit=29
+	fi
+else
+	echo "Initial dump"
+	mv $globalwork $globalfile
+	successful_files="$successful_files $globalfile"
+fi
+
+compress_file() {
+	if [ -n "$compress_inline" -a "$compress_inline" != "0" ]; then
+		# Assume compression has already happened
+		mv $workfile $sqlfile
+		mv $worksumfile $sumfile
+		successful_files="$successful_files $sqlfile $sumfile"
+		return 0
+	fi
+
+	echo "Compressing dump of $db"
+	rm -f $workfile$compext
+	nice $compressor $workfile
+	if [ $? -ne 0 ]; then
+		echo "Error running $compressor; leaving old dump intact and work files remain" >&2
+		exit=25
+	else
+		mv $workfile$compext $sqlfile
+		mv $worksumfile $sumfile
+		successful_files="$successful_files $sqlfile $sumfile"
+	fi
+}
+
+compress_pipe() {
+	if [ -n "$compress_inline" -a "$compress_inline" != "0" ]; then
+		nice $compressor -c
+	else
+		# NOOP
+		cat
+	fi
+}
+
+successful_backups=0
+
+# Loop through each database
+for db in `psql -X template1 -A -t -c "SELECT datname FROM pg_database $dbwhere $dborderby"`
+do
+	echo "Dumping database $db"
+	date
+	workext=.work
+	sumext=.md5sum
+	basename=$hostname-pgsql-$db.sql
+	sqlfile=$basename$compext
+	workfile=$basename$workext
+	sumfile=$basename$sumext
+	worksumfile=$workfile$sumext
+	if [ -f $workfile ]; then
+		echo "Removing file that is in the way: $workfile" >&2
+		rm -f $workfile
+		exit=30
+	fi
+	if [ -f $worksumfile ]; then
+		echo "Removing file that is in the way: $worksumfile" >&2
+		rm -f $worksumfile
+		exit=31
+	fi
+	pg_dump -C $db | tee >(md5sum > $worksumfile) | compress_pipe > $workfile
+	if [ $? -ne 0 ]; then
+		echo "Error dumping; leaving old dump intact and work file remains" >&2
+		exit=21
+	else
+		if [ -f $sqlfile -a -f $sumfile ]; then
+			cmp -s $sumfile $worksumfile
+			if [ $? -eq 0 ]; then
+				echo "Dump is identical to last time; leaving old dump intact"
+				rm -f $workfile $worksumfile
+				((successful_backups++))
+			elif [ $? -eq 1 ]; then
+				echo "Dump is different; replacing old dump with new one"
+				compress_file
+				((successful_backups++))
+			else
+				echo "Error comparing new to old dump; work files remain" >&2
+				exit=26
+			fi
+		else
+			echo "Initial dump"
+			compress_file
+			((successful_backups++))
+		fi
+	fi
+done
+
+if [ $successful_backups -eq 0 ]; then
+	echo "No successful backups were performed"
+	exit=1
+fi
+
+if [ $exit -eq 0 ]; then
+	if [ -x $scriptdir/pgsql-backup-post ]; then
+		echo "Executing $scriptdir/pgsql-backup-post"
+		$scriptdir/pgsql-backup-post $successful_files
+	fi
+
+	date | tee $hostname-pgsql-success.txt
+else
+	date
+fi
+echo Done
+
+exit $exit
